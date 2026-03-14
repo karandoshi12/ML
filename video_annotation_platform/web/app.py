@@ -36,16 +36,55 @@ from src.pipeline import AnnotationPipeline
 app = FastAPI(title="Video Annotation Platform", version="1.0.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
-OUTPUTS_DIR = Path(__file__).parent.parent / "outputs"
 CONFIG_PATH = Path(__file__).parent.parent / "configs" / "config.yaml"
 
+# On Vercel, /tmp is the only writable directory. Use it for both outputs
+# and job-state files so polling survives across stateless Lambda invocations.
+# On a regular server, keep outputs next to the package as before.
+_ON_VERCEL = os.environ.get("VAP_ENV") == "vercel"
+OUTPUTS_DIR = Path("/tmp/vap_outputs") if _ON_VERCEL else Path(__file__).parent.parent / "outputs"
+_JOBS_DIR   = Path("/tmp/vap_jobs")    if _ON_VERCEL else Path(__file__).parent.parent / "outputs" / ".jobs"
+
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# In-memory job store: {job_id: {status, progress, total, error, manifest_path}}
-jobs: Dict[str, Dict[str, Any]] = {}
+# ---------------------------------------------------------------------------
+# Job state helpers
+# Persist job state to individual JSON files in _JOBS_DIR so that:
+#   - local server: in-process reads work as before
+#   - Vercel: polling requests (different Lambda instances) can read state
+#     from /tmp which is shared within the same function execution context
+# ---------------------------------------------------------------------------
 jobs_lock = threading.Lock()
+
+def _job_path(job_id: str) -> Path:
+    return _JOBS_DIR / f"{job_id}.json"
+
+def _write_job(job_id: str, data: Dict[str, Any]) -> None:
+    with jobs_lock:
+        tmp = _job_path(job_id).with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(_job_path(job_id))
+
+def _update_job(job_id: str, update: Dict[str, Any]) -> None:
+    with jobs_lock:
+        path = _job_path(job_id)
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data.update(update)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+
+def _read_job(job_id: str) -> Dict[str, Any] | None:
+    path = _job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 # ---------------------------------------------------------------------------
 # Pipeline singleton (loaded once)
@@ -67,23 +106,21 @@ def _run_annotation(
     annotator: str,
     max_frames: int,
 ) -> None:
-    """Runs in a background thread. Updates jobs[job_id] as it progresses."""
-    with jobs_lock:
-        jobs[job_id]["status"] = "running"
+    """Runs in a background thread. Persists state via _update_job()."""
+    _update_job(job_id, {"status": "running"})
+
+    # On Vercel force Claude-only (BLIP-2/YOLO are not installed)
+    if _ON_VERCEL and annotator == "auto":
+        annotator = "claude"
 
     output_dir = str(OUTPUTS_DIR / job_id)
 
     try:
         pipeline = _get_pipeline()
-
-        # Override config at pipeline level via config merge
         pipeline.config.setdefault("change_detection", {})["combined_threshold"] = sensitivity
         pipeline.config.setdefault("annotation", {})["primary"] = annotator
         pipeline.config.setdefault("output", {})["save_annotated_frames"] = True
 
-        # Wrap pipeline.run so we can intercept progress
-        # We monkey-patch tqdm via the env var approach isn't reliable,
-        # so instead we add a simple per-step counter via subclassing.
         json_path = pipeline.run(
             video_path=video_path,
             output_dir=output_dir,
@@ -93,31 +130,25 @@ def _run_annotation(
             visualize=True,
         )
 
-        # Load the episode JSON to count total steps
         with open(json_path) as f:
             episode = json.load(f)
 
         total_steps = len(episode.get("steps", []))
-
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "done",
-                "manifest_path": json_path,
-                "episode_dir": output_dir,
-                "progress": total_steps,
-                "total": total_steps,
-            })
+        _update_job(job_id, {
+            "status": "done",
+            "manifest_path": json_path,
+            "episode_dir": output_dir,
+            "progress": total_steps,
+            "total": total_steps,
+        })
 
     except Exception as exc:
-        tb = traceback.format_exc()
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "error",
-                "error": str(exc),
-                "traceback": tb,
-            })
+        _update_job(job_id, {
+            "status": "error",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        })
     finally:
-        # Clean up uploaded temp video file
         try:
             os.remove(video_path)
         except OSError:
@@ -170,18 +201,17 @@ async def annotate(
 
     job_id = str(uuid.uuid4())
 
-    with jobs_lock:
-        jobs[job_id] = {
-            "status": "pending",
-            "progress": 0,
-            "total": 0,
-            "filename": video.filename,
-            "manifest_path": None,
-            "error": None,
-        }
+    _write_job(job_id, {
+        "status": "pending",
+        "progress": 0,
+        "total": 0,
+        "filename": video.filename,
+        "manifest_path": None,
+        "error": None,
+    })
 
-    # Run pipeline in background thread (FastAPI BackgroundTasks run in the
-    # event loop; we use threading to avoid blocking async routes)
+    # Run pipeline in a background thread so the HTTP response returns
+    # immediately and the client can poll /status/{job_id}.
     thread = threading.Thread(
         target=_run_annotation,
         args=(job_id, video_path, sensitivity, annotator, max_frames),
@@ -195,8 +225,7 @@ async def annotate(
 @app.get("/status/{job_id}")
 async def status(job_id: str):
     """Poll job status. Returns {status, progress, total, error?}."""
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = _read_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -212,9 +241,7 @@ async def status(job_id: str):
 @app.get("/result/{job_id}")
 async def result(job_id: str):
     """Return the full episode.json for a completed job."""
-    with jobs_lock:
-        job = jobs.get(job_id)
-
+    job = _read_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
@@ -248,4 +275,5 @@ async def serve_frame(job_id: str, filename: str):
 @app.get("/health")
 async def health():
     """Simple health check."""
-    return {"status": "ok", "jobs_count": len(jobs)}
+    job_count = len(list(_JOBS_DIR.glob("*.json"))) if _JOBS_DIR.exists() else 0
+    return {"status": "ok", "jobs_count": job_count, "env": "vercel" if _ON_VERCEL else "local"}

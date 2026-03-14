@@ -1,0 +1,32 @@
+{
+  "version": 2,
+
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
+    }
+  ],
+
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
+  ],
+
+  "functions": {
+    "api/index.py": {
+      "memory": 1024,
+      "maxDuration": 300
+    }
+  },
+
+  "env": {
+    "ANTHROPIC_API_KEY": "@anthropic_api_key",
+    "VAP_ENV": "vercel"
+  }
+}

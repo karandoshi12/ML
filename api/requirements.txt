@@ -1,0 +1,15 @@
+# Vercel deployment requirements
+# torch / transformers / ultralytics are intentionally excluded:
+# they exceed Vercel's 250 MB compressed Lambda size limit.
+# On Vercel the annotator is forced to "claude" (Claude Vision API only).
+
+anthropic>=0.40.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+Pillow>=10.0.0
+pyyaml>=6.0
+fastapi>=0.111.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+aiofiles>=23.2.1
+tqdm>=4.66.0
