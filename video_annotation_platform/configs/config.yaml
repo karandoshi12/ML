@@ -1,0 +1,39 @@
+video:
+  supported_formats: ["mp4", "avi", "mov", "mkv"]
+  max_resolution: [1920, 1080]
+  resize_frames: true
+  target_size: [640, 480]
+
+change_detection:
+  mse_threshold: 500.0
+  flow_threshold: 2.0
+  combined_threshold: 0.3
+  mse_weight: 0.4
+  flow_weight: 0.6
+  min_keyframe_interval: 5
+  always_include_first_last: true
+
+annotation:
+  primary: "auto"               # "claude" | "local" | "auto"
+  claude_model: "claude-sonnet-4-6"
+  claude_max_tokens: 1024
+  claude_image_quality: "high"  # "low" | "high" | "auto"
+  local_caption_model: "Salesforce/blip2-opt-2.7b"
+  local_detection_model: "yolov8n.pt"
+  local_device: "cpu"           # "cpu" | "cuda"
+  max_objects_per_frame: 10
+  api_retry_attempts: 3
+  api_retry_delay: 2.0
+
+action:
+  use_optical_flow: true
+  flow_algorithm: "farneback"
+  motion_threshold: 1.5
+
+output:
+  save_raw_frames: true
+  save_annotated_frames: true
+  image_format: "jpg"
+  image_quality: 95
+  json_indent: 2
+  episode_prefix: "episode"
